@@ -1,0 +1,512 @@
+---
+title: "Project Personalised Healthcare | SVM & Random Forest"
+author: Nicole Formenti, Letizia Molinari, Ulan Shaikyp
+date: June 2021
+output:
+  ioslides_presentation: 
+     widescreen: true
+     smaller: true
+     logo: logo.png
+---
+
+<style type="text/css">
+
+h2 {
+  text-align: center;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: darkred
+}
+
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library('mlr3')
+library('mlr3learners')
+library('mlr3viz')
+library('mlr3tuning')
+library('paradox')
+library('mlr3pipelines')
+library('e1071')
+library('mlr3filters')
+library('praznik')
+library('survivalmodels')
+library('mlr3proba')
+library('survival')
+library('mlr3misc')
+library('survival')
+library('devtools')
+#remotes::install_github("mlr-org/mlr3extralearners")
+library('mlr3extralearners')
+library('ranger')
+install_learners('surv.svm')
+library('fastDummies')
+```
+
+
+## BENCHMARK: COX REGRESSION
+
+---
+
+Preprocess the dataset
+```{r}
+# remove useless variables
+gbcs2 = gbcs[,c(5:12,15:16)]
+
+# fix data type
+gbcs$grade = as.factor(gbcs$grade)
+gbcs2$age = scale(gbcs2$age) 
+gbcs2$size = scale(gbcs2$size)
+gbcs2$nodes = scale(gbcs2$nodes)
+gbcs2$prog_recp = scale(gbcs2$prog_recp)
+gbcs2$estrg_recp = scale(gbcs2$estrg_recp)
+
+#  transform the menopause and hormone status into 0 and 1 variables
+gbcs2$menopause = gbcs2$menopause-1
+gbcs2$hormone = gbcs2$hormone-1
+
+# create the dummies for the grade
+grade123 = fastDummies::dummy_cols(gbcs2$grade)
+
+# create the new matrix
+gbcs1 = data.frame(gbcs2[,c(1:4, 6:10)], grade1 = grade123[,2], grade2 = grade123[,3], grade3 = grade123[,4])
+```
+
+---
+
+Below, the final dataset
+```{r}
+head(gbcs1)
+```
+
+---
+
+Create the survival task 
+```{r}
+task_gbcs = TaskSurv$new(id = "gbcs", backend = gbcs1, time = "survtime", event = "censdead")
+```
+
+Create the Cox Regression learner
+```{r echo = T, results = 'hide'}
+learner.cox = lrn("surv.coxph")
+```
+
+Perform 10-folds cross-validation
+```{r echo = T, results = 'hide'}
+set.seed(123)
+cv10 = rsmp('cv',folds=10)
+
+# pass the task, the learner and the resampling object
+rr = resample(task_gbcs, learner.cox, cv10)
+avg_cscore = rr$aggregate(msr("surv.cindex"))
+```
+
+Return the average model score *Harrell's C-index*
+```{r}
+print(avg_cscore)
+```
+
+--- 
+
+Plot the scores of the single trials
+
+```{r}
+scores = rr$score()
+plot(scores[, c('iteration','surv.harrell_c')], type='b',ylim=c(0,1), xlim=c(1,10),col = c("red"))
+```
+
+
+## SUPPORT VECTOR MACHINES
+
+---
+
+#### SSVM: ALGORITHM FOR SURVIVAL SVM
+
+-	While the Cox model focuses on explicitly modelling the probabilistic mechanism of the phenomenon under study, the main focus of SVM is learning a predictive rule which will generalize well to the unseen data
+-	The algorithm for SSVM is based on the **concordance index**, which measures the association between predicted and observed failures in case of right censored data.
+-	It equals the ratio of concordant to comparable pairs of data points
+- Two samples *i* and *j* are comparable if the survival time $t_i$ of *i* is minor than the survival time of *j*: $(t_i<t_j)$ and the censoring variable $\delta$ is equal to one. ($\delta_i = 1$ if the event is observed, while $\delta_i = 0$ in case of censoring)
+- Two pair of samples *i* and *j* is concordant if they are comparable and the predicted health variable corresponding to the sample $x_i$ is lower than the predicted heath variable corresponding to the sample $x_j$ 
+- The sample-based concordance index of a model generating predictions $u(x_i)$ for samples $x_i$ from a dataset $D={(x_i,t_i,δ_i)}\:\:i\:=1,…,N$ can be expressed as :
+
+$$CI_N(u)=\frac{1}{(N(N-1))}\sum_{i≠j}I[\:(u(x_i)-u(x_j))\:(t(x_i)-t(x_j))\:]$$
+
+---
+
+### OPTIMAL HEALTH FUNCTION
+- The learning strategy tries to find a mapping $U: R^d→R$ which reconstructs the orders in the observed failure times measured by the corresponding $CI_N$
+- Unfortunately, directly optimizing over $CI_N$ is hard from the combinatorial point of view, so a convex relaxation written in terms of a hinge loss is proposed
+- The optimal health function $u(x_i)= ω^T φ(xi):R^d→R$ can be found as 
+$(ω ̂,ζ ̂ ) =argmin\: ω,ζ\: \frac{1}{2}\:  ω^T ω+C\sum_{i<j,δi=1} Vij\: ζij$, subject to $ω^T φ= ω^T φ(xi)≥1-ζ_ij$ and $ζ_ij≥0,\:∀i,j=1,…,N$ with $C$ a positive real constant and $V_{ij}=1$ if the pair $(x_i, x_j)$ is comparable, $0$ otherwise
+- $φ: R^d  ⟶ R^{dφ}$ is a feature map such that $K(x,x')=φ(x)^T φ(x')$ is a positive definite kernel function $K:R^d× R^d  →R$
+- The major drawback of this algorithm is the large computational cost, which makes this method not applicable to large datasets
+
+---
+
+Create the Survival SVM learner
+```{r}
+learner.svm = suppressWarnings(mlr3::lrn("surv.svm"))
+```
+
+Show the learner possible parameters
+```{r}
+learner.svm$param_set$ids()
+```
+
+--- 
+
+The implementation 'surv.svm' provides 4 different **SVM models** adapted to perform survival analysis:
+
+* *regression*: it includes regression constraints 
+* *vanbelle1*: it includes regression contraints 
+* *vanbelle2*: it is modelled as a ranking problem
+* *hybrid*: it contains both regression and ranking constraints
+
+The available **kernels** are:
+
+* *lin_kernel*: linear kernel
+* *add_kernel*: clinical kernel, developed for clinical use
+* *rbf_kernel*: radial basis function kernel
+* *poly_kernel*: polynomial kernel
+
+Other parameters to be tuned are 
+
+* **gamma.mu**: regularisation parameters of SVM
+* **diff.meth**: it builds the matrix of differences on comparable pairs
+
+---
+
+The dataset is divided into training and test set. The hyperparameters are tuned on the training set through a 5-folds cross validation, then the final score is assessed on the test set.
+
+Create train and test set split
+```{r}
+set.seed(123)
+train_set = sample(nrow(gbcs1), 0.8 * nrow(gbcs1))
+test_set = setdiff(seq_len(nrow(gbcs1)), train_set)
+
+train_gbcs1 = gbcs1[train_set, ]
+test_gbcs1 = gbcs1[test_set, ]
+
+print(dim(train_gbcs1))
+print(dim(test_gbcs1))
+```
+
+Create train and test tasks 
+```{r}
+task_train_gbcs1 = TaskSurv$new(id = "gbcs", backend = train_gbcs1, time = "survtime", event = "censdead")
+task_test_gbcs1 = TaskSurv$new(id = "gbcs", backend = test_gbcs1, time = "survtime", event = "censdead")
+```
+
+--- 
+
+Unfortunately, not all models work. This is due to:
+
+* **Errors during the optimisation**
+* **Implementation problems for the hybrid SVM model**: the parameter 'gamma.mu' requires a vector of 2 values for this model, however when defining the parameters we must indicate a minimum and a maximum value for float parameters. Hence, an error is raised when the model is optimised saying that the parameter 'gamma.mu' must be a vector of two numeric values.
+
+The only models which work are:
+
+1. Regression with linear kernel
+2. Regression with rbf kernel
+3. Regression with clinical kernel
+
+For all of them the 'iprop' optimiser is used. There is no need to use the parameter *diff.meth*
+
+---
+
+Define the 3 models
+```{r}
+learner.svm.regression.1 = suppressWarnings(mlr3::lrn("surv.svm", gamma.mu=0.01, type='regression', 
+                                                      kernel='lin_kernel'))
+learner.svm.regression.2 = suppressWarnings(mlr3::lrn("surv.svm", gamma.mu=0.01, type='regression', 
+                                                      kernel='rbf_kernel'))
+learner.svm.regression.3 = suppressWarnings(mlr3::lrn("surv.svm", gamma.mu=0.01, type='regression', 
+                                                      kernel='add_kernel'))
+```
+
+Define the searching space
+```{r}
+searchspace.svm.regression = ParamSet$new(list(
+  ParamDbl$new('gamma.mu', 0.01, 2),
+  ParamFct$new('opt.meth', 'ipop')
+))
+```
+
+---
+
+Create a summary table to store the optimised hyperparameters and the score of all the different SVM regression models
+```{r}
+models_results.svm = data.frame(
+  'model_name'=rep(NA,3), 'kernel'=rep(NA,3), 'opt.meth'=rep(NA,3),
+  'gamma.mu'=rep(NA,3), 'test_c_harrell'=rep(NA,3))
+```
+
+---
+
+Tune the hyperparameters for each model and then compute the score of the best model on the test set.
+
+```{r echo = T, results = 'hide', size='\\tiny'}
+set.seed(124)
+c=1
+
+for(learner in c(learner.svm.regression.1, learner.svm.regression.2, learner.svm.regression.3)) {
+instance = TuningInstanceSingleCrit$new(
+  task_train_gbcs1, learner, rsmp('cv',folds=5), msr('surv.cindex'), trm("evals", n_evals = 5), 
+  searchspace.svm.regression #Searching Space
+  )
+
+  # perform a random search to optimise the hyper parameters
+  rsearch = tnr('random_search') #Tuner
+  rsearch$optimize(instance) 
+  models_results.svm$gamma.mu[c]=instance$result_learner_param_vals$gamma.mu
+  models_results.svm$model_name[c]=instance$result_learner_param_vals$type
+  models_results.svm$kernel[c]=instance$result_learner_param_vals$kernel
+  models_results.svm$opt.meth[c]=instance$result_learner_param_vals$opt.meth
+  # train the model on the training set by using the optimised hyper parameters
+  learner$param_set$values = instance$result_learner_param_vals
+  learner$train(task_train_gbcs1)
+  # make predictions on the test set
+  prediction.svm = learner$predict(task_test_gbcs1)
+  models_results.svm$test_c_harrell[c] = prediction.svm$score(msr('surv.cindex'))
+  
+  c=c+1
+}
+```
+
+---
+
+Scores *Harrell's C-index* of the regression SVM models
+```{r}
+models_results.svm
+```
+
+
+## RANDOM FOREST
+
+---
+
+- A random forest is a nonparametric machine learning strategy that can be used for building a risk prediction model in survival analysis. 
+- In RF, randomization is introduced in two forms. First, a randomly drawn bootstrap sample of the data is used to grow a tree. Second, at each node of the tree, a randomly selected subset of variables (covariates) is chosen as candidate variables for splitting.
+- Averaging over trees, in combination with the randomization used in growing a tree, enables RF to approximate rich classes of functions while maintaining low generalization error
+- Considerable empirical evidence has shown RF to be highly accurate
+
+---
+
+#### RANDOM SURVIVAL FOREST (randomSurvivalForest)
+- In random survival forests *(Ishwaran et al. 2008)*, the ensemble is constructed by aggregating tree-based Nelson-Aalen estimators
+- In each terminal node of a tree, the conditional cumulative hazard function $\widehat{H_b} (t│x)$ is estimated using the Nelson-Aalen using the “in-bag” data
+$$ \widehat{H_b} (t│x)=∫_0^t\frac{\tilde{N_b^*}(ds,x)}{\widetilde{Y_b^* (s,x)}}$$ where $\tilde{N_b}^*(s, x)$ counts the uncensored events until time $s$ and
+$\tilde{Y_b}^*(s, x)$ is the number at risk at time $s$.
+- The ensemble survival function from random survival forest is
+$$\hat{S}^{rsf}(t│x)=exp⁡(-\frac{1}{B} ∑_{b=1}^{B}\widehat{H_b}(t│x)$$
+
+---
+
+Preprocess the dataset. In the case of random forest no dummy variables are needed
+```{r}
+# remove useless variables
+gbcs2 = gbcs[,c(5:12,15:16)]
+
+# fix data type
+gbcs$grade = as.factor(gbcs$grade)
+gbcs2$age = scale(gbcs2$age) 
+gbcs2$size = scale(gbcs2$size)
+gbcs2$nodes = scale(gbcs2$nodes)
+gbcs2$prog_recp = scale(gbcs2$prog_recp)
+gbcs2$estrg_recp = scale(gbcs2$estrg_recp)
+
+# we transform the menopause and hormone status into 0 and 1 variables
+gbcs2$menopause = gbcs2$menopause-1
+gbcs2$hormone = gbcs2$hormone-1
+```
+
+---
+
+Below, the final dataset
+
+```{r}
+head(gbcs2)
+```
+
+---
+
+Create the Random Forest learner using the implementation 'surv.ranger' 
+```{r}
+learner.rf = suppressWarnings(mlr3::lrn("surv.ranger"))
+```
+
+Show the possible parameters 
+
+```{r}
+learner.rf$param_set$ids()
+```
+
+---
+
+The parameters to be tuned are:
+
+* **mad.depth**: depth of the single trees
+* **num.trees**: total number of trees to use
+* **min.node.size**: minimal number of observations per node
+* **mtry**: number of variables randomly selected to be used at each split
+* **splitrule**: splitting rule
+
+---
+
+2 alternative methods are used:
+
+1. **Training and test set split**: optimise the hyper parameters with a 5-folds cross-validation on the training set and then test the best model on the test set
+2. **Nested cross validation**: optimise the hyper parameters with an inner 5-folds cross-validation. Assess the final score with an outer 5 folds cross validation. According to the documentation of *mlr3* website, the outer cross validation is performed by only using the held out set, not on the set used for the training. Hence, the problem of over optimistic performances should be reduced.
+
+---
+
+#### 1. TRAIN AND TEST SET SPLIT
+
+Perform a 5-folds cross-validation on the training set, then retrieve the score on the test set.
+Split the train and test set
+```{r}
+set.seed(123)
+train_set = sample(nrow(gbcs2), 0.8 * nrow(gbcs2))
+test_set = setdiff(seq_len(nrow(gbcs2)), train_set)
+
+train_gbcs = gbcs2[train_set, ]
+test_gbcs = gbcs2[test_set, ]
+
+print(dim(train_gbcs))
+print(dim(test_gbcs))
+```
+
+--- 
+
+Create the train and test tasks
+```{r}
+task_train_gbcs2 = TaskSurv$new(id = "gbcs", backend = train_gbcs, time = "survtime", event = "censdead")
+task_test_gbcs2 = TaskSurv$new(id = "gbcs", backend = test_gbcs, time = "survtime", event = "censdead")
+```
+
+Create the searching space
+```{r}
+searchspace.rf = ParamSet$new(list(
+  ParamInt$new('max.depth', 1, 100),
+  ParamInt$new('num.trees', 500, 1000),
+  ParamInt$new('min.node.size', 5, 30),
+  ParamInt$new('mtry', 1, 8),
+  ParamFct$new('splitrule',c("logrank", "extratrees", "C","maxstat"))
+))
+```
+
+Create the instance object of hyperparameters tuning
+```{r}
+instance = TuningInstanceSingleCrit$new(
+  task_train_gbcs2, #Task
+  learner.rf, #Learner
+  rsmp('cv',folds=5), #Resampling
+  msr('surv.cindex'), #Measure
+  trm("evals", n_evals = 5), #Terminator  
+  searchspace.rf #Searching space
+  )
+```
+
+---
+
+Perform a random search for optimising the hyper parameters
+```{r echo = T, results = 'hide'}
+set.seed(123)
+rsearch = tnr('random_search') #Tuner
+rsearch$optimize(instance)
+```
+
+---
+
+Hyperparameters values of the best model
+
+```{r}
+instance$result_learner_param_vals
+```
+
+---
+
+Train the best model on the training set
+```{r echo = T, results = 'hide'}
+set.seed(123)
+learner.rf$param_set$values = instance$result_learner_param_vals
+learner.rf$train(task_train_gbcs2)
+```
+
+Make predictions on the test set and retrieve the score *Harrell's C-index*
+```{r}
+set.seed(123)
+prediction.rf = learner.rf$predict(task_test_gbcs2)
+prediction.rf$score(msr('surv.cindex'))
+```
+
+---
+
+#### 2. NESTED CROSS VALIDATION
+
+Below, an image taken from the *mlr3* documentation
+```{r fig.width=10, fig.height=5, echo=FALSE}
+library(png)
+library(grid)
+img <- readPNG("nested_resampling.png")
+grid.raster(img)
+```
+
+---
+
+
+Create the task
+```{r}
+task_gbcs2 = TaskSurv$new(id = "gbcs", backend = gbcs2, time = "survtime", event = "censdead")
+```
+
+Create the setting for hyperparameters tuning
+```{r}
+optlrnrf = AutoTuner$new(
+  learner.rf, #Learner
+  rsmp('cv',folds=5), #Resampling 
+  msr('surv.cindex'), #Measure
+  trm("evals", n_evals = 5), #Terminator 
+  tnr('random_search'), #Tuner
+  searchspace.rf #Searching space
+  )
+
+```
+
+---
+
+Perform the 5-folds nested cross-validation
+```{r echo = T, results = 'hide'}
+set.seed(123)
+rr = resample(task_gbcs2, optlrnrf, rsmp('cv',folds=5), store_models=TRUE)
+```
+
+Show the average score *Harrell's C-index*
+```{r}
+avg_cscore_rf= rr$aggregate(msr("surv.cindex"))
+print(avg_cscore_rf)
+```
+
+---
+
+Plot the scores of the single trials
+
+```{r}
+scores = rr$score()
+plot(scores[, c('iteration','surv.harrell_c')], type='b',ylim=c(0,1), xlim=c(1,5),col = c("red"))
+```
+
+---
+
+### CONCLUSIONS
+
+- Performance of the BENCHMARK MODEL:  $0.739$
+- Best performance of the SURVIVAL SVM MODEL: $0.656$
+- Best performance of the RANDOM FOREST MODEL: $0.738$ 
+
+The SVM model performed significantly worse than the Cox Regression with a performance about 10% lower. On the other hand, the Survival Random Forest model obtained nearly the same performance by using an inner 5-folds cross-validation followed by an outer 5-folds cross-validation.
